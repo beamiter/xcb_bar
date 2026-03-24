@@ -533,8 +533,15 @@ fn main() -> Result<()> {
         pill_hpadding: 10.0,
         pill_radius: 12.0,
         shape_style: ShapeStyle::Pill,
-        time_icon: "TIME",
-        screenshot_label: "SHOT",
+        time_icon: "🕐",
+        screenshot_label: "📸",
+
+        tag_labels: ["🖥", "🌐", "📁", "💬", "📝", "🎵", "⚙", "📊", "🏠"],
+        theme_dark_label: "🌙",
+        theme_light_label: "☀️",
+        monitor_labels: ["🥇", "🥈", "🥉", "❔"],
+        volume_label: "🔊",
+        mute_label: "🔇",
 
         show_audio: true,
         show_theme_toggle: true,
