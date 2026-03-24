@@ -313,17 +313,23 @@ fn tuned_colors_for_theme(mode: ThemeMode) -> xbar_core::Colors {
     let mut c = colors_for_theme(mode);
     match mode {
         ThemeMode::Dark => {
-            // 更柔和的深色背景 + 更高对比文字
+            // relm_bar inspired: cohesive teal/cyan dark theme
             c.bg = Color::rgb(13, 16, 23);
             c.text = Color::rgb(235, 238, 245);
-            c.gray = Color::rgb(90, 96, 110);
-            c.time = Color::rgb(86, 156, 214);
+            c.gray = Color::rgb(45, 55, 72);
+            c.time = Color::rgb(9, 41, 64);
+            c.accent = Color::rgb(8, 145, 178);
+            c.accent_light = Color::rgb(34, 211, 238);
+            c.dim = Color::rgb(81, 90, 104);
         }
         ThemeMode::Light => {
             c.bg = Color::rgb(246, 247, 250);
             c.text = Color::rgb(22, 24, 28);
-            c.gray = Color::rgb(120, 128, 145);
-            c.time = Color::rgb(60, 120, 210);
+            c.gray = Color::rgb(203, 213, 225);
+            c.time = Color::rgb(224, 242, 254);
+            c.accent = Color::rgb(59, 130, 246);
+            c.accent_light = Color::rgb(96, 165, 250);
+            c.dim = Color::rgb(100, 116, 139);
         }
     }
     c
@@ -523,9 +529,9 @@ fn main() -> Result<()> {
         bar_height: 38,
         padding_x: 10.0,
         padding_y: 6.0,
-        tag_spacing: 8.0,
-        pill_hpadding: 12.0,
-        pill_radius: 10.0,
+        tag_spacing: 6.0,
+        pill_hpadding: 10.0,
+        pill_radius: 12.0,
         shape_style: ShapeStyle::Pill,
         time_icon: "TIME",
         screenshot_label: "SHOT",
