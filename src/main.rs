@@ -703,12 +703,18 @@ fn main() -> Result<()> {
         unsafe { MaybeUninit::zeroed().assume_init() };
 
     let periodic_tick = |state: &mut AppState| -> Result<bool> {
+        let mut changed = false;
+        let new_time = state.format_time();
+        if new_time != state.last_time_string {
+            state.last_time_string = new_time;
+            changed = true;
+        }
         if state.last_monitor_update.elapsed() >= Duration::from_secs(2) {
-            state.system_monitor.update_if_needed();
-            state.audio_manager.update_if_needed();
+            changed |= state.system_monitor.update_if_needed();
+            changed |= state.audio_manager.update_if_needed();
             state.last_monitor_update = Instant::now();
         }
-        Ok(true)
+        Ok(changed)
     };
 
     loop {
