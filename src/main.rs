@@ -703,18 +703,12 @@ fn main() -> Result<()> {
         unsafe { MaybeUninit::zeroed().assume_init() };
 
     let periodic_tick = |state: &mut AppState| -> Result<bool> {
-        let mut need_redraw = false;
-        if state.last_clock_update.elapsed() >= Duration::from_secs(1) {
-            state.last_clock_update = Instant::now();
-            need_redraw = true;
-        }
         if state.last_monitor_update.elapsed() >= Duration::from_secs(2) {
             state.system_monitor.update_if_needed();
             state.audio_manager.update_if_needed();
             state.last_monitor_update = Instant::now();
-            need_redraw = true;
         }
-        Ok(need_redraw)
+        Ok(true)
     };
 
     loop {
