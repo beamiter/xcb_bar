@@ -1,8 +1,8 @@
 use anyhow::Result;
-use cairo::ffi::{xcb_connection_t, xcb_visualtype_t};
-use cairo::{Context, XCBConnection as CairoXCBConnection, XCBDrawable, XCBSurface, XCBVisualType};
+use xbar_core::cairo::ffi::{xcb_connection_t, xcb_visualtype_t};
+use xbar_core::cairo::{Context, XCBConnection as CairoXCBConnection, XCBDrawable, XCBSurface, XCBVisualType};
 use log::{debug, warn};
-use pango::FontDescription;
+use xbar_core::pango::FontDescription;
 use shared_structures::SharedRingBuffer;
 use std::env;
 use std::mem::MaybeUninit;

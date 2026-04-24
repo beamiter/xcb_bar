@@ -12,7 +12,4 @@ shared_structures = { git = "https://github.com/beamiter/shared_structures.git",
 libc = "0.2.176"
 log = "0.4.28"
 
-cairo-rs = { version = "0.21.2", features = ["xcb"] }
-pango = "0.21.3"
-pangocairo = "0.21.2"
 xcb = "1.6.0"
