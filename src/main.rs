@@ -1,30 +1,35 @@
-use anyhow::Result;
-use xbar_core::cairo::ffi::{xcb_connection_t, xcb_visualtype_t};
-use xbar_core::cairo::{Context, XCBConnection as CairoXCBConnection, XCBDrawable, XCBSurface, XCBVisualType};
+use anyhow::{Result, anyhow};
+use cairo::ffi::{xcb_connection_t, xcb_visualtype_t};
+use cairo::{Context, XCBConnection as CairoXCBConnection, XCBDrawable, XCBSurface, XCBVisualType};
 use log::{debug, warn};
-use xbar_core::pango::FontDescription;
-use shared_structures::SharedRingBuffer;
+use pango::FontDescription;
 use std::env;
-use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd as _;
-use std::sync::Arc;
+use std::io;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+use xbar_core::linux::AlignedTimer;
+use xbar_core::presentation::{Point, PointerAction, PresentationConfig, Size};
+use xbar_core::render::cairo::CairoBar;
 use xbar_core::{
-    AppState, BarConfig, Color, ShapeStyle, ThemeMode, arm_second_timer, colors_for_theme,
-    draw_bar, initialize_logging, spawn_shared_eventfd_notifier,
+    BarEffect, BarRuntime, ModelConfig, MonitorGeometry, RuntimeUpdate, SharedEventNotifier,
+    SharedTransport,
 };
-
-use libc;
-
 use xcb::{self, Xid, x};
 
-// ---------------- Cairo XCB 桥接（xcb 版本） ----------------
+const X_TOKEN: u64 = 1;
+const TIMER_TOKEN: u64 = 2;
+const SHARED_TOKEN: u64 = 3;
+const TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+// ---------------- Cairo XCB bridge ----------------
 struct CairoXcb {
-    cxcb_conn: CairoXCBConnection,
+    connection: CairoXCBConnection,
     visual: XCBVisualType,
     _visual_owner: Box<x::Visualtype>,
 }
+
 fn find_visual_by_id_and_depth(
     screen: &x::Screen,
     target_visual_id: u32,
@@ -34,111 +39,122 @@ fn find_visual_by_id_and_depth(
         if depth.depth() == target_depth {
             for visual in depth.visuals() {
                 if visual.visual_id() == target_visual_id {
-                    return Some(visual.clone());
+                    return Some(*visual);
                 }
             }
         }
     }
     None
 }
+
 fn build_cairo_xcb(conn: &xcb::Connection, screen: &x::Screen) -> Result<CairoXcb> {
-    let root_visual_id = screen.root_visual();
-    let root_depth = screen.root_depth();
-    let visual = find_visual_by_id_and_depth(screen, root_visual_id, root_depth)
-        .ok_or_else(|| anyhow::anyhow!("Could not find visualtype for root_visual"))?;
+    let visual = find_visual_by_id_and_depth(screen, screen.root_visual(), screen.root_depth())
+        .ok_or_else(|| anyhow!("could not find the root X visual"))?;
     let visual_owner = Box::new(visual);
-    let ptr = (&*visual_owner) as *const x::Visualtype as *mut xcb_visualtype_t;
-    let cxcb_vis = unsafe { XCBVisualType::from_raw_none(ptr) };
-    let raw = conn.get_raw_conn();
-    let cxcb_conn = unsafe { CairoXCBConnection::from_raw_none(raw as *mut xcb_connection_t) };
+    let visual_ptr = (&*visual_owner) as *const x::Visualtype as *mut xcb_visualtype_t;
+    let visual = unsafe { XCBVisualType::from_raw_none(visual_ptr) };
+    let raw_connection = conn.get_raw_conn();
+    let connection =
+        unsafe { CairoXCBConnection::from_raw_none(raw_connection.cast::<xcb_connection_t>()) };
+
     Ok(CairoXcb {
-        cxcb_conn,
-        visual: cxcb_vis,
+        connection,
+        visual,
         _visual_owner: visual_owner,
     })
 }
 
-// ---------------- 后备缓冲（xcb 版本） ----------------
+// ---------------- XCB back buffer ----------------
 struct BackBuffer {
-    pm: x::Pixmap,
+    pixmap: x::Pixmap,
     width: u16,
     height: u16,
     depth: u8,
     surface: Option<XCBSurface>,
-    cr: Option<Context>,
+    context: Option<Context>,
 }
+
 impl BackBuffer {
     fn new(
         conn: &xcb::Connection,
         screen: &x::Screen,
         win: x::Window,
-        w: u16,
-        h: u16,
+        width: u16,
+        height: u16,
     ) -> Result<Self> {
-        let pm = conn.generate_id();
+        let pixmap = conn.generate_id();
         conn.send_and_check_request(&x::CreatePixmap {
             depth: screen.root_depth(),
-            pid: pm,
+            pid: pixmap,
             drawable: x::Drawable::Window(win),
-            width: w,
-            height: h,
+            width,
+            height,
         })?;
         Ok(Self {
-            pm,
-            width: w,
-            height: h,
+            pixmap,
+            width,
+            height,
             depth: screen.root_depth(),
             surface: None,
-            cr: None,
+            context: None,
         })
     }
-    fn ensure_surface<'a>(&'a mut self, cx: &CairoXcb) -> Result<&'a Context> {
+
+    fn ensure_context<'a>(&'a mut self, cairo_xcb: &CairoXcb) -> Result<&'a Context> {
         if self.surface.is_none() {
-            let drawable = XCBDrawable(self.pm.resource_id());
+            let drawable = XCBDrawable(self.pixmap.resource_id());
             let surface = XCBSurface::create(
-                &cx.cxcb_conn,
+                &cairo_xcb.connection,
                 &drawable,
-                &cx.visual,
-                self.width as i32,
-                self.height as i32,
+                &cairo_xcb.visual,
+                i32::from(self.width),
+                i32::from(self.height),
             )?;
-            let cr = Context::new(&surface)?;
+            let context = Context::new(&surface)?;
             self.surface = Some(surface);
-            self.cr = Some(cr);
+            self.context = Some(context);
         }
-        Ok(self.cr.as_ref().unwrap())
+        self.context
+            .as_ref()
+            .ok_or_else(|| anyhow!("Cairo context was not initialized"))
     }
+
     fn flush(&self) {
-        if let Some(s) = &self.surface {
-            s.flush();
+        if let Some(surface) = &self.surface {
+            surface.flush();
         }
     }
+
     fn resize_if_needed(
         &mut self,
         conn: &xcb::Connection,
         win: x::Window,
-        w: u16,
-        h: u16,
+        width: u16,
+        height: u16,
     ) -> Result<()> {
-        if self.width == w && self.height == h {
+        if self.width == width && self.height == height {
             return Ok(());
         }
-        conn.send_and_check_request(&x::FreePixmap { pixmap: self.pm })?;
-        let pm = conn.generate_id();
+
+        conn.send_and_check_request(&x::FreePixmap {
+            pixmap: self.pixmap,
+        })?;
+        let pixmap = conn.generate_id();
         conn.send_and_check_request(&x::CreatePixmap {
             depth: self.depth,
-            pid: pm,
+            pid: pixmap,
             drawable: x::Drawable::Window(win),
-            width: w,
-            height: h,
+            width,
+            height,
         })?;
-        self.pm = pm;
-        self.width = w;
-        self.height = h;
+        self.pixmap = pixmap;
+        self.width = width;
+        self.height = height;
         self.surface = None;
-        self.cr = None;
+        self.context = None;
         Ok(())
     }
+
     fn blit_to_window(
         &self,
         conn: &xcb::Connection,
@@ -146,7 +162,7 @@ impl BackBuffer {
         gc: x::Gcontext,
     ) -> Result<()> {
         conn.send_and_check_request(&x::CopyArea {
-            src_drawable: x::Drawable::Pixmap(self.pm),
+            src_drawable: x::Drawable::Pixmap(self.pixmap),
             dst_drawable: x::Drawable::Window(win),
             gc,
             src_x: 0,
@@ -160,7 +176,7 @@ impl BackBuffer {
     }
 }
 
-// ---------------- EWMH atoms（xcb 版本） ----------------
+// ---------------- EWMH ----------------
 struct Atoms {
     net_wm_window_type: x::Atom,
     net_wm_window_type_dock: x::Atom,
@@ -176,12 +192,11 @@ struct Atoms {
 }
 
 fn intern_atom(conn: &xcb::Connection, name: &str) -> Result<x::Atom> {
-    let ck = conn.send_request(&x::InternAtom {
+    let cookie = conn.send_request(&x::InternAtom {
         only_if_exists: false,
         name: name.as_bytes(),
     });
-    let reply = conn.wait_for_reply(ck)?;
-    Ok(reply.atom())
+    Ok(conn.wait_for_reply(cookie)?.atom())
 }
 
 fn intern_atoms(conn: &xcb::Connection) -> Result<Atoms> {
@@ -204,19 +219,18 @@ fn change_property_32(
     conn: &xcb::Connection,
     win: x::Window,
     property: x::Atom,
-    r#type: x::Atom,
+    property_type: x::Atom,
     data: &[u32],
 ) -> Result<()> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for v in data {
-        bytes.extend_from_slice(&v.to_ne_bytes());
-    }
+    // Passing u32 values directly is significant: xcb derives the protocol
+    // format from the element type, so this emits format=32 rather than the
+    // format=8 request produced by the former byte conversion.
     conn.send_and_check_request(&x::ChangeProperty {
         mode: x::PropMode::Replace,
         window: win,
         property,
-        r#type,
-        data: &bytes,
+        r#type: property_type,
+        data,
     })?;
     Ok(())
 }
@@ -225,26 +239,56 @@ fn change_property_8(
     conn: &xcb::Connection,
     win: x::Window,
     property: x::Atom,
-    r#type: x::Atom,
+    property_type: x::Atom,
     data: &[u8],
 ) -> Result<()> {
     conn.send_and_check_request(&x::ChangeProperty {
         mode: x::PropMode::Replace,
         window: win,
         property,
-        r#type,
+        r#type: property_type,
         data,
     })?;
     Ok(())
 }
 
+fn update_strut(
+    conn: &xcb::Connection,
+    atoms: &Atoms,
+    win: x::Window,
+    x: i32,
+    y: i32,
+    width: u32,
+    bar_height: u16,
+) -> Result<()> {
+    let top = u32::try_from(y)
+        .unwrap_or(0)
+        .saturating_add(u32::from(bar_height));
+    let top_start_x = u32::try_from(x).unwrap_or(0);
+    let top_end_x = top_start_x.saturating_add(width.saturating_sub(1));
+    let strut_partial = [0, 0, top, 0, 0, 0, 0, 0, top_start_x, top_end_x, 0, 0];
+    change_property_32(
+        conn,
+        win,
+        atoms.net_wm_strut_partial,
+        atoms.cardinal,
+        &strut_partial,
+    )?;
+    change_property_32(
+        conn,
+        win,
+        atoms.net_wm_strut,
+        atoms.cardinal,
+        &[0, 0, top, 0],
+    )
+}
+
 fn set_dock_properties(
     conn: &xcb::Connection,
     atoms: &Atoms,
-    screen: &x::Screen,
     win: x::Window,
-    _w: u16,
-    h: u16,
+    width: u32,
+    bar_height: u16,
 ) -> Result<()> {
     change_property_32(
         conn,
@@ -260,303 +304,309 @@ fn set_dock_properties(
         atoms.atom,
         &[atoms.net_wm_state_above.resource_id()],
     )?;
-    change_property_32(
-        conn,
-        win,
-        atoms.net_wm_desktop,
-        atoms.cardinal,
-        &[0xFFFFFFFF],
-    )?;
-
-    let sw = screen.width_in_pixels() as u32;
-    let top = h as u32;
-    let top_start_x = 0u32;
-    let top_end_x = (sw.saturating_sub(1)) as u32;
-    let strut_partial = [0, 0, top, 0, 0, 0, 0, 0, top_start_x, top_end_x, 0, 0];
-    change_property_32(
-        conn,
-        win,
-        atoms.net_wm_strut_partial,
-        atoms.cardinal,
-        &strut_partial,
-    )?;
-    let strut = [0u32, 0, top, 0];
-    change_property_32(conn, win, atoms.net_wm_strut, atoms.cardinal, &strut)?;
-
-    change_property_8(conn, win, atoms.net_wm_name, atoms.utf8_string, b"xcb_bar")?;
-    Ok(())
+    change_property_32(conn, win, atoms.net_wm_desktop, atoms.cardinal, &[u32::MAX])?;
+    update_strut(conn, atoms, win, 0, 0, width, bar_height)?;
+    change_property_8(conn, win, atoms.net_wm_name, atoms.utf8_string, b"xcb_bar")
 }
 
-// ---------------- redraw ----------------
+// ---------------- Platform integration ----------------
+struct WindowAdapter<'a> {
+    conn: &'a xcb::Connection,
+    screen: &'a x::Screen,
+    atoms: &'a Atoms,
+    win: x::Window,
+    bar_height: u16,
+}
+
+impl WindowAdapter<'_> {
+    fn apply_runtime_update(&self, update: RuntimeUpdate) -> Result<bool> {
+        let needs_redraw = update.needs_redraw();
+        for issue in update.issues {
+            warn!("xbar runtime issue: {issue:?}");
+        }
+        for effect in update.platform_effects {
+            self.apply_effect(effect)?;
+        }
+        Ok(needs_redraw)
+    }
+
+    fn apply_effect(&self, effect: BarEffect) -> Result<()> {
+        match effect {
+            BarEffect::ApplyMonitorGeometry(geometry) => self.apply_geometry(geometry),
+            BarEffect::ClearMonitorGeometry => self.apply_geometry(MonitorGeometry {
+                x: 0,
+                y: 0,
+                width: u32::from(self.screen.width_in_pixels()),
+                height: u32::from(self.screen.height_in_pixels()),
+            }),
+            BarEffect::Screenshot => {
+                launch_and_reap("flameshot", &["gui"]);
+                Ok(())
+            }
+            BarEffect::OpenAudioControl => {
+                launch_and_reap("pavucontrol", &[]);
+                Ok(())
+            }
+            BarEffect::WindowManager(command) => {
+                warn!("no shared transport handled window-manager command: {command:?}");
+                Ok(())
+            }
+            BarEffect::ToggleMute
+            | BarEffect::AdjustVolume(_)
+            | BarEffect::AdjustBrightness(_)
+            | BarEffect::RefreshBattery => {
+                warn!("enabled xbar provider unexpectedly returned platform effect: {effect:?}");
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_geometry(&self, geometry: MonitorGeometry) -> Result<()> {
+        let width = geometry.width.max(1);
+        self.conn.send_and_check_request(&x::ConfigureWindow {
+            window: self.win,
+            value_list: &[
+                x::ConfigWindow::X(geometry.x),
+                x::ConfigWindow::Y(geometry.y),
+                x::ConfigWindow::Width(width),
+                x::ConfigWindow::Height(u32::from(self.bar_height)),
+            ],
+        })?;
+        update_strut(
+            self.conn,
+            self.atoms,
+            self.win,
+            geometry.x,
+            geometry.y,
+            width,
+            self.bar_height,
+        )?;
+        self.conn.flush()?;
+        Ok(())
+    }
+}
+
+fn launch_and_reap(program: &'static str, args: &'static [&'static str]) {
+    let spawn = thread::Builder::new()
+        .name(format!("xcb-bar-{program}"))
+        .spawn(move || match Command::new(program).args(args).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => warn!("{program} exited with {status}"),
+            Err(error) => warn!("failed to launch {program}: {error}"),
+        });
+    if let Err(error) = spawn {
+        warn!("failed to create launcher thread for {program}: {error}");
+    }
+}
+
+fn pointer_action(button: u8) -> Option<PointerAction> {
+    match button {
+        1 => Some(PointerAction::Primary),
+        3 => Some(PointerAction::Secondary),
+        4 => Some(PointerAction::ScrollUp),
+        5 => Some(PointerAction::ScrollDown),
+        _ => None,
+    }
+}
+
 fn redraw(
     cairo_xcb: &CairoXcb,
-    conn: &xcb::Connection,
+    window: &WindowAdapter<'_>,
     back: &mut BackBuffer,
-    win: x::Window,
     gc: x::Gcontext,
     width: u16,
     height: u16,
-    colors: &xbar_core::Colors,
-    state: &mut AppState,
-    font: &FontDescription,
-    cfg: &BarConfig,
+    bar: &mut CairoBar,
 ) -> Result<()> {
-    let cr = back.ensure_surface(cairo_xcb)?;
-    draw_bar(cr, width, height, colors, state, font, cfg)?;
+    let context = back.ensure_context(cairo_xcb)?;
+    bar.render(context, Size::new(f32::from(width), f32::from(height)))?;
+    let _ = bar.runtime_mut().take_changes();
     back.flush();
-    back.blit_to_window(conn, win, gc)?;
-    conn.flush()?;
+    back.blit_to_window(window.conn, window.win, gc)?;
+    window.conn.flush()?;
     Ok(())
 }
 
-fn tuned_colors_for_theme(mode: ThemeMode) -> xbar_core::Colors {
-    let mut c = colors_for_theme(mode);
-    match mode {
-        ThemeMode::Dark => {
-            // relm_bar inspired: cohesive teal/cyan dark theme
-            c.bg = Color::rgb(13, 16, 23);
-            c.text = Color::rgb(235, 238, 245);
-            c.gray = Color::rgb(45, 55, 72);
-            c.time = Color::rgb(9, 41, 64);
-            c.accent = Color::rgb(8, 145, 178);
-            c.accent_light = Color::rgb(34, 211, 238);
-            c.dim = Color::rgb(81, 90, 104);
-        }
-        ThemeMode::Light => {
-            c.bg = Color::rgb(246, 247, 250);
-            c.text = Color::rgb(22, 24, 28);
-            c.gray = Color::rgb(203, 213, 225);
-            c.time = Color::rgb(224, 242, 254);
-            c.accent = Color::rgb(59, 130, 246);
-            c.accent_light = Color::rgb(96, 165, 250);
-            c.dim = Color::rgb(100, 116, 139);
-        }
-    }
-    c
-}
-
-// ---------------- 事件处理 ----------------
+#[allow(clippy::too_many_arguments)]
 fn handle_x_event(
     event: xcb::Event,
     cairo_xcb: &CairoXcb,
-    conn: &xcb::Connection,
+    window: &WindowAdapter<'_>,
     back: &mut BackBuffer,
-    win: x::Window,
     gc: x::Gcontext,
     current_width: &mut u16,
     current_height: &mut u16,
-    colors: &mut xbar_core::Colors,
-    state: &mut AppState,
-    font: &FontDescription,
-    cfg: &BarConfig,
+    bar: &mut CairoBar,
 ) -> Result<()> {
+    let mut should_redraw = false;
+
     match event {
-        xcb::Event::X(x::Event::Expose(e)) => {
-            if e.count() == 0 {
-                back.blit_to_window(conn, win, gc)?;
-                conn.flush()?;
+        xcb::Event::X(x::Event::Expose(event)) => {
+            if event.count() == 0 {
+                back.blit_to_window(window.conn, window.win, gc)?;
+                window.conn.flush()?;
             }
         }
-        xcb::Event::X(x::Event::ConfigureNotify(e)) => {
-            if e.window() == win {
-                *current_width = e.width() as u16;
-                *current_height = e.height() as u16;
-                back.resize_if_needed(conn, win, *current_width, *current_height)?;
-                redraw(
-                    cairo_xcb,
-                    conn,
-                    back,
-                    win,
-                    gc,
-                    *current_width,
-                    *current_height,
-                    colors,
-                    state,
-                    font,
-                    cfg,
-                )?;
-            }
+        xcb::Event::X(x::Event::ConfigureNotify(event)) if event.window() == window.win => {
+            *current_width = event.width();
+            *current_height = event.height();
+            back.resize_if_needed(window.conn, window.win, *current_width, *current_height)?;
+            should_redraw = true;
         }
-
-        // 进入窗口：更新 hover（使所有 pill 即时响应）
-        xcb::Event::X(x::Event::EnterNotify(e)) => {
-            // 注意：EnterNotify 事件通常也有 event_x/event_y
-            if state.update_hover(e.event_x(), e.event_y()) {
-                redraw(
-                    cairo_xcb,
-                    conn,
-                    back,
-                    win,
-                    gc,
-                    *current_width,
-                    *current_height,
-                    colors,
-                    state,
-                    font,
-                    cfg,
-                )?;
-            }
+        xcb::Event::X(x::Event::EnterNotify(event)) => {
+            should_redraw = bar.pointer_motion(Point::new(
+                f32::from(event.event_x()),
+                f32::from(event.event_y()),
+            ));
         }
-
-        // 离开窗口：清空 hover（通过一个无效坐标）
-        xcb::Event::X(x::Event::LeaveNotify(_e)) => {
-            if state.clear_hover() {
-                redraw(
-                    cairo_xcb,
-                    conn,
-                    back,
-                    win,
-                    gc,
-                    *current_width,
-                    *current_height,
-                    &*colors,
-                    state,
-                    font,
-                    cfg,
-                )?;
-            }
+        xcb::Event::X(x::Event::LeaveNotify(_)) => {
+            should_redraw = bar.pointer_leave();
         }
-
-        // 鼠标移动：统一走 AppState::update_hover，使所有 pill 都有 hover 反馈
-        xcb::Event::X(x::Event::MotionNotify(e)) => {
-            if state.update_hover(e.event_x(), e.event_y()) {
-                redraw(
-                    cairo_xcb,
-                    conn,
-                    back,
-                    win,
-                    gc,
-                    *current_width,
-                    *current_height,
-                    &*colors,
-                    state,
-                    font,
-                    cfg,
-                )?;
-            }
+        xcb::Event::X(x::Event::MotionNotify(event)) => {
+            should_redraw = bar.pointer_motion(Point::new(
+                f32::from(event.event_x()),
+                f32::from(event.event_y()),
+            ));
         }
-
-        xcb::Event::X(x::Event::ButtonPress(e)) => {
-            let px = e.event_x();
-            let py = e.event_y();
-            let button: u8 = e.detail().into();
-            let before_theme = state.theme_mode;
-            if state.handle_buttons(px, py, button) {
-                if state.theme_mode != before_theme {
-                    *colors = tuned_colors_for_theme(state.theme_mode);
-                }
-                redraw(
-                    cairo_xcb,
-                    conn,
-                    back,
-                    win,
-                    gc,
-                    *current_width,
-                    *current_height,
-                    &*colors,
-                    state,
-                    font,
-                    cfg,
-                )?;
+        xcb::Event::X(x::Event::ButtonPress(event)) => {
+            let button = event.detail();
+            if let Some(input) = pointer_action(button) {
+                let update = bar.pointer_action(
+                    Point::new(f32::from(event.event_x()), f32::from(event.event_y())),
+                    input,
+                );
+                should_redraw = window.apply_runtime_update(update)?;
             }
         }
         _ => {}
     }
-    Ok(())
-}
 
-fn drain_x_events(
-    cairo_xcb: &CairoXcb,
-    conn: &xcb::Connection,
-    back: &mut BackBuffer,
-    win: x::Window,
-    gc: x::Gcontext,
-    current_width: &mut u16,
-    current_height: &mut u16,
-    colors: &mut xbar_core::Colors,
-    state: &mut AppState,
-    font: &FontDescription,
-    cfg: &BarConfig,
-) -> Result<()> {
-    while let Ok(Some(event)) = conn.poll_for_event() {
-        handle_x_event(
-            event,
+    if should_redraw {
+        redraw(
             cairo_xcb,
-            conn,
+            window,
             back,
-            win,
             gc,
-            current_width,
-            current_height,
-            colors,
-            state,
-            font,
-            cfg,
+            *current_width,
+            *current_height,
+            bar,
         )?;
     }
     Ok(())
 }
 
-// ---------------- 主程序 ----------------
-fn main() -> Result<()> {
-    // 参数
-    let args: Vec<String> = env::args().collect();
-    let shared_path = args.iter().skip(1).last().cloned().unwrap_or_default();
-
-    // 日志
-    if let Err(e) = initialize_logging("xcb_bar", &shared_path) {
-        eprintln!("Failed to initialize logging: {}", e);
-        std::process::exit(1);
+#[allow(clippy::too_many_arguments)]
+fn drain_x_events(
+    cairo_xcb: &CairoXcb,
+    window: &WindowAdapter<'_>,
+    back: &mut BackBuffer,
+    gc: x::Gcontext,
+    current_width: &mut u16,
+    current_height: &mut u16,
+    bar: &mut CairoBar,
+) -> Result<()> {
+    loop {
+        match window.conn.poll_for_event() {
+            Ok(Some(event)) => handle_x_event(
+                event,
+                cairo_xcb,
+                window,
+                back,
+                gc,
+                current_width,
+                current_height,
+                bar,
+            )?,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
     }
+}
 
-    // 共享内存
-    let shared_buffer = SharedRingBuffer::create_shared_ring_buffer_aux(&shared_path).map(Arc::new);
-    let shared_efd = spawn_shared_eventfd_notifier(shared_buffer.clone(), true);
+fn create_epoll() -> io::Result<OwnedFd> {
+    let raw_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if raw_fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: epoll_create1 returned a new descriptor whose sole owner is
+        // transferred into OwnedFd.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+    }
+}
 
-    // X 连接
+fn epoll_add(epoll: RawFd, descriptor: RawFd, token: u64) -> io::Result<()> {
+    let mut event = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: token,
+    };
+    let result = unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, descriptor, &mut event) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn epoll_wait(epoll: RawFd, events: &mut [libc::epoll_event]) -> io::Result<usize> {
+    loop {
+        let ready = unsafe {
+            libc::epoll_wait(
+                epoll,
+                events.as_mut_ptr(),
+                i32::try_from(events.len()).unwrap_or(i32::MAX),
+                -1,
+            )
+        };
+        if ready >= 0 {
+            return Ok(ready as usize);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+}
+
+fn open_transport(path: &str) -> Result<Option<SharedTransport>> {
+    if path.is_empty() {
+        return Ok(None);
+    }
+    SharedTransport::open(path)
+        .map(Some)
+        .map_err(|error| anyhow!("failed to open shared transport {path:?}: {error}"))
+}
+
+fn main() -> Result<()> {
+    let shared_path = env::args().skip(1).last().unwrap_or_default();
+    xbar_core::logging::init("xcb_bar", &shared_path)?;
+
+    // Bars are consumers: open an existing WM-owned transport and never
+    // create or unlink it. The notifier owns both its eventfd and worker.
+    let transport = open_transport(&shared_path)?;
+    let notifier: Option<SharedEventNotifier> = transport
+        .as_ref()
+        .map(|transport| transport.notifier(true))
+        .transpose()?;
+    let runtime = BarRuntime::with_transport(ModelConfig::default(), transport)?;
+
     let (conn, screen_num) = xcb::Connection::connect(None)?;
     let setup = conn.get_setup();
     let screen = setup
         .roots()
         .nth(screen_num as usize)
-        .ok_or_else(|| anyhow::anyhow!("No screen found"))?;
+        .ok_or_else(|| anyhow!("no X screen found"))?;
+    let cairo_xcb = build_cairo_xcb(&conn, screen)?;
 
-    // Cairo XCB 桥接
-    let cairo_xcb = build_cairo_xcb(&conn, &screen)?;
+    let presentation = PresentationConfig::default();
+    let bar_height = presentation
+        .bar_height
+        .round()
+        .clamp(1.0, f32::from(u16::MAX)) as u16;
+    let font_name = env::var("XBAR_FONT").unwrap_or_else(|_| "monospace 11".to_owned());
+    let font = FontDescription::from_string(&font_name);
+    let mut bar = CairoBar::new(runtime, presentation, font);
+    let mut last_transport_attempt = Instant::now();
 
-    // 界面配置
-    let cfg = BarConfig {
-        bar_height: 38,
-        padding_x: 10.0,
-        padding_y: 6.0,
-        tag_spacing: 6.0,
-        pill_hpadding: 10.0,
-        pill_radius: 12.0,
-        shape_style: ShapeStyle::Pill,
-        time_icon: "🕐",
-        screenshot_label: "📸",
-
-        tag_labels: ["🖥", "🌐", "📁", "💬", "📝", "🎵", "⚙", "📊", "🏠"],
-        theme_dark_label: "🌙",
-        theme_light_label: "☀️",
-        monitor_labels: ["🥇", "🥈", "🥉", "❔"],
-        volume_label: "🔊",
-        mute_label: "🔇",
-        brightness_label: "🔆",
-        battery_label: "🔋",
-        battery_charging_label: "⚡",
-        cpu_label: "🧠",
-        mem_label: "💾",
-
-        show_audio: true,
-        show_theme_toggle: true,
-        show_brightness: true,
-        show_battery: true,
-        volume_step: 5,
-        brightness_step: 5,
-    };
-
-    // 窗口 + GC
     let win = conn.generate_id();
     let gc = conn.generate_id();
     conn.send_and_check_request(&x::CreateGc {
@@ -566,21 +616,7 @@ fn main() -> Result<()> {
     })?;
 
     let mut current_width = screen.width_in_pixels();
-    let mut current_height = cfg.bar_height;
-
-    // 创建窗口，背景 None，设置事件掩码
-    let cw_values = &[
-        x::Cw::BackPixmap(x::Pixmap::none()),
-        x::Cw::EventMask(
-            x::EventMask::EXPOSURE
-                | x::EventMask::STRUCTURE_NOTIFY
-                | x::EventMask::BUTTON_PRESS
-                | x::EventMask::BUTTON_RELEASE
-                | x::EventMask::POINTER_MOTION
-                | x::EventMask::ENTER_WINDOW
-                | x::EventMask::LEAVE_WINDOW,
-        ),
-    ];
+    let mut current_height = bar_height;
     conn.send_and_check_request(&x::CreateWindow {
         depth: x::COPY_FROM_PARENT as u8,
         wid: win,
@@ -592,269 +628,130 @@ fn main() -> Result<()> {
         border_width: 0,
         class: x::WindowClass::InputOutput,
         visual: screen.root_visual(),
-        value_list: cw_values,
+        value_list: &[
+            x::Cw::BackPixmap(x::Pixmap::none()),
+            x::Cw::EventMask(
+                x::EventMask::EXPOSURE
+                    | x::EventMask::STRUCTURE_NOTIFY
+                    | x::EventMask::BUTTON_PRESS
+                    | x::EventMask::POINTER_MOTION
+                    | x::EventMask::ENTER_WINDOW
+                    | x::EventMask::LEAVE_WINDOW,
+            ),
+        ],
     })?;
 
     let atoms = intern_atoms(&conn)?;
-    set_dock_properties(&conn, &atoms, &screen, win, current_width, current_height)?;
+    set_dock_properties(&conn, &atoms, win, u32::from(current_width), current_height)?;
     conn.send_and_check_request(&x::MapWindow { window: win })?;
     conn.flush()?;
 
-    // 明确背景不自动清空
-    conn.send_and_check_request(&x::ChangeWindowAttributes {
-        window: win,
-        value_list: &[x::Cw::BackPixmap(x::Pixmap::none())],
-    })?;
+    let window = WindowAdapter {
+        conn: &conn,
+        screen,
+        atoms: &atoms,
+        win,
+        bar_height,
+    };
+    let mut back = BackBuffer::new(
+        window.conn,
+        window.screen,
+        window.win,
+        current_width,
+        current_height,
+    )?;
 
-    // 字体
-    // 字体（尽量不依赖 Nerd Font；可用 XBAR_FONT 覆盖）
-    let font_str = env::var("XBAR_FONT").unwrap_or_else(|_| "monospace 11".to_string());
-    let font = FontDescription::from_string(&font_str);
-
-    // 后备缓冲
-    let mut back = BackBuffer::new(&conn, &screen, win, current_width, current_height)?;
-
-    // 状态
-    let mut state = AppState::new(shared_buffer);
-    state.theme_mode = ThemeMode::Dark;
-
-    // 配色（跟随主题）
-    let mut colors = tuned_colors_for_theme(state.theme_mode);
-
-    // 首次绘制
+    // Seed providers and consume any snapshot that was queued before startup.
+    let mut initial_update = bar.tick();
+    initial_update.merge(bar.poll_transport());
+    window.apply_runtime_update(initial_update)?;
     redraw(
         &cairo_xcb,
-        &conn,
+        &window,
         &mut back,
-        win,
         gc,
         current_width,
         current_height,
-        &colors,
-        &mut state,
-        &font,
-        &cfg,
+        &mut bar,
     )?;
 
-    // epoll + timerfd
-    let x_fd = conn.as_raw_fd();
-
-    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    if epfd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+    let timer = AlignedTimer::new(Duration::from_secs(1))?;
+    let epoll = create_epoll()?;
+    epoll_add(epoll.as_raw_fd(), window.conn.as_raw_fd(), X_TOKEN)?;
+    epoll_add(epoll.as_raw_fd(), timer.as_raw_fd(), TIMER_TOKEN)?;
+    if let Some(notifier) = notifier.as_ref() {
+        epoll_add(epoll.as_raw_fd(), notifier.as_raw_fd(), SHARED_TOKEN)?;
     }
 
-    let tfd = unsafe {
-        libc::timerfd_create(
-            libc::CLOCK_MONOTONIC,
-            libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
-        )
-    };
-    if tfd < 0 {
-        let e = std::io::Error::last_os_error();
-        unsafe { libc::close(epfd) };
-        return Err(e.into());
-    }
-    arm_second_timer(tfd).map_err(|e| anyhow::anyhow!("arm_second_timer failed: {}", e))?;
-
-    const X_TOKEN: u64 = 1;
-    const TFD_TOKEN: u64 = 2;
-    const SHARED_TOKEN: u64 = xbar_core::SHARED_TOKEN;
-
-    let mut ev_x = libc::epoll_event {
-        events: libc::EPOLLIN as u32,
-        u64: X_TOKEN,
-    };
-    let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, x_fd, &mut ev_x as *mut _) };
-    if rc < 0 {
-        let e = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(tfd);
-            libc::close(epfd);
-        }
-        return Err(e.into());
-    }
-
-    let mut ev_t = libc::epoll_event {
-        events: libc::EPOLLIN as u32,
-        u64: TFD_TOKEN,
-    };
-    let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, tfd, &mut ev_t as *mut _) };
-    if rc < 0 {
-        let e = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(tfd);
-            libc::close(epfd);
-        }
-        return Err(e.into());
-    }
-
-    if let Some(efd) = shared_efd {
-        let mut ev_s = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: SHARED_TOKEN,
-        };
-        let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, efd, &mut ev_s as *mut _) };
-        if rc < 0 {
-            let e = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(tfd);
-                libc::close(epfd);
-                libc::close(efd);
-            }
-            return Err(e.into());
-        }
-    }
-
-    const EP_EVENTS_CAP: usize = 32;
-    let mut events: [libc::epoll_event; EP_EVENTS_CAP] =
-        unsafe { MaybeUninit::zeroed().assume_init() };
-
-    let periodic_tick = |state: &mut AppState| -> Result<bool> {
-        let mut changed = false;
-        let new_time = state.format_time();
-        if new_time != state.last_time_string {
-            state.last_time_string = new_time;
-            changed = true;
-        }
-        if state.last_monitor_update.elapsed() >= Duration::from_secs(2) {
-            changed |= state.system_monitor.update_if_needed();
-            changed |= state.audio_manager.update_if_needed();
-            state.last_monitor_update = Instant::now();
-        }
-        Ok(changed)
-    };
+    const EVENT_CAPACITY: usize = 32;
+    let mut events: [libc::epoll_event; EVENT_CAPACITY] =
+        std::array::from_fn(|_| libc::epoll_event { events: 0, u64: 0 });
 
     loop {
-        let nfds = loop {
-            let n =
-                unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), EP_EVENTS_CAP as i32, -1) };
-            if n >= 0 {
-                break n;
-            }
-            let err = std::io::Error::last_os_error();
-            if let Some(code) = err.raw_os_error() {
-                if code == libc::EINTR {
-                    continue;
-                }
-            }
-            warn!("[main] epoll_wait failed: {}", err);
-            thread::sleep(Duration::from_millis(10));
-            break 0;
-        };
-
-        for i in 0..(nfds as usize) {
-            let ev = events[i];
-            match ev.u64 {
-                X_TOKEN => {
-                    drain_x_events(
-                        &cairo_xcb,
-                        &conn,
-                        &mut back,
-                        win,
-                        gc,
-                        &mut current_width,
-                        &mut current_height,
-                        &mut colors,
-                        &mut state,
-                        &font,
-                        &cfg,
-                    )?;
-                }
-                TFD_TOKEN => {
-                    let mut buf = [0u8; 8];
-                    loop {
-                        let r = unsafe {
-                            libc::read(tfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                        };
-                        if r == 8 {
-                            if periodic_tick(&mut state)? {
-                                redraw(
-                                    &cairo_xcb,
-                                    &conn,
-                                    &mut back,
-                                    win,
-                                    gc,
-                                    current_width,
-                                    current_height,
-                                    &colors,
-                                    &mut state,
-                                    &font,
-                                    &cfg,
-                                )?;
-                            }
-                            continue;
-                        } else if r < 0 {
-                            let err = std::io::Error::last_os_error();
-                            if let Some(code) = err.raw_os_error() {
-                                if code == libc::EAGAIN || code == libc::EWOULDBLOCK {
-                                    break;
+        let ready = epoll_wait(epoll.as_raw_fd(), &mut events)?;
+        for event in events.iter().take(ready) {
+            match event.u64 {
+                X_TOKEN => drain_x_events(
+                    &cairo_xcb,
+                    &window,
+                    &mut back,
+                    gc,
+                    &mut current_width,
+                    &mut current_height,
+                    &mut bar,
+                )?,
+                TIMER_TOKEN => {
+                    if timer.drain()? > 0 {
+                        if !shared_path.is_empty()
+                            && bar.runtime().transport().is_none()
+                            && last_transport_attempt.elapsed() >= TRANSPORT_RETRY_INTERVAL
+                        {
+                            last_transport_attempt = Instant::now();
+                            match SharedTransport::open(&shared_path) {
+                                Ok(transport) => {
+                                    bar.runtime_mut().set_transport(Some(transport));
+                                    debug!("reconnected WM transport at {shared_path}");
                                 }
-                            }
-                            warn!("[main] timerfd read error: {}", err);
-                            break;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                SHARED_TOKEN => {
-                    if let Some(efd) = shared_efd {
-                        let mut buf8 = [0u8; 8];
-                        loop {
-                            let r = unsafe {
-                                libc::read(efd, buf8.as_mut_ptr() as *mut libc::c_void, buf8.len())
-                            };
-                            if r == 8 {
-                                continue;
-                            } else if r < 0 {
-                                let err = std::io::Error::last_os_error();
-                                if let Some(code) = err.raw_os_error() {
-                                    if code == libc::EAGAIN || code == libc::EWOULDBLOCK {
-                                        break;
-                                    }
-                                }
-                                warn!("[main] eventfd read error: {}", err);
-                                break;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        let mut need_redraw = false;
-                        if let Some(buf_arc) = state.shared_buffer.as_ref().cloned() {
-                            match buf_arc.try_read_latest_message() {
-                                Ok(Some(msg)) => {
-                                    log::trace!("redraw by msg: {:?}", msg);
-                                    state.update_from_shared(msg);
-                                    need_redraw = true;
-                                }
-                                Ok(None) => { /* 没有消息 */ }
-                                Err(e) => {
-                                    warn!("Shared try_read_latest_message failed: {}", e);
+                                Err(error) => {
+                                    debug!("WM transport is still unavailable: {error}");
                                 }
                             }
                         }
-                        if need_redraw {
+                        let mut update = bar.tick();
+                        update.merge(bar.poll_transport());
+                        if window.apply_runtime_update(update)? {
                             redraw(
                                 &cairo_xcb,
-                                &conn,
+                                &window,
                                 &mut back,
-                                win,
                                 gc,
                                 current_width,
                                 current_height,
-                                &colors,
-                                &mut state,
-                                &font,
-                                &cfg,
+                                &mut bar,
                             )?;
                         }
                     }
                 }
-                other => {
-                    debug!("[main] unexpected epoll token: {}", other);
+                SHARED_TOKEN => {
+                    if let Some(notifier) = notifier.as_ref() {
+                        notifier.drain()?;
+                        let update = bar.poll_transport();
+                        if window.apply_runtime_update(update)? {
+                            redraw(
+                                &cairo_xcb,
+                                &window,
+                                &mut back,
+                                gc,
+                                current_width,
+                                current_height,
+                                &mut bar,
+                            )?;
+                        }
+                    } else {
+                        warn!("received shared token without an owned notifier");
+                    }
                 }
+                token => debug!("unexpected epoll token: {token}"),
             }
         }
     }
