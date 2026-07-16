@@ -3,19 +3,19 @@ use cairo::ffi::{xcb_connection_t, xcb_visualtype_t};
 use cairo::{Context, XCBConnection as CairoXCBConnection, XCBDrawable, XCBSurface, XCBVisualType};
 use log::{debug, warn};
 use pango::FontDescription;
+use std::cell::RefCell;
 use std::env;
 use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
-use std::process::Command;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use xbar_core::linux::AlignedTimer;
 use xbar_core::presentation::{Point, PointerAction, PresentationConfig, Size};
 use xbar_core::render::cairo::CairoBar;
 use xbar_core::{
-    BarEffect, BarRuntime, ModelConfig, MonitorGeometry, RuntimeUpdate, SharedEventNotifier,
-    SharedTransport,
+    BarEffect, BarRuntime, ModelConfig, MonitorGeometry, NotifierChange, PlatformEffectHandler,
+    RuntimeUpdate, TransportNotifierSlot, TransportRecoveryConfig,
 };
+use xbar_linux_actions::ProcessActionHandler;
 use xcb::{self, Xid, x};
 
 const X_TOKEN: u64 = 1;
@@ -316,6 +316,7 @@ struct WindowAdapter<'a> {
     atoms: &'a Atoms,
     win: x::Window,
     bar_height: u16,
+    process_actions: RefCell<ProcessActionHandler>,
 }
 
 impl WindowAdapter<'_> {
@@ -339,12 +340,8 @@ impl WindowAdapter<'_> {
                 width: u32::from(self.screen.width_in_pixels()),
                 height: u32::from(self.screen.height_in_pixels()),
             }),
-            BarEffect::Screenshot => {
-                launch_and_reap("flameshot", &["gui"]);
-                Ok(())
-            }
-            BarEffect::OpenAudioControl => {
-                launch_and_reap("pavucontrol", &[]);
+            effect @ (BarEffect::Screenshot | BarEffect::OpenAudioControl) => {
+                self.process_actions.borrow_mut().handle(effect)?;
                 Ok(())
             }
             BarEffect::WindowManager(command) => {
@@ -383,19 +380,6 @@ impl WindowAdapter<'_> {
         )?;
         self.conn.flush()?;
         Ok(())
-    }
-}
-
-fn launch_and_reap(program: &'static str, args: &'static [&'static str]) {
-    let spawn = thread::Builder::new()
-        .name(format!("xcb-bar-{program}"))
-        .spawn(move || match Command::new(program).args(args).status() {
-            Ok(status) if status.success() => {}
-            Ok(status) => warn!("{program} exited with {status}"),
-            Err(error) => warn!("failed to launch {program}: {error}"),
-        });
-    if let Err(error) = spawn {
-        warn!("failed to create launcher thread for {program}: {error}");
     }
 }
 
@@ -567,27 +551,27 @@ fn epoll_wait(epoll: RawFd, events: &mut [libc::epoll_event]) -> io::Result<usiz
     }
 }
 
-fn open_transport(path: &str) -> Result<Option<SharedTransport>> {
-    if path.is_empty() {
-        return Ok(None);
+fn sync_notifier(
+    slot: &mut TransportNotifierSlot,
+    runtime: &BarRuntime,
+    epoll: RawFd,
+) -> Result<()> {
+    if let NotifierChange::Replaced { fd, .. } = slot.sync(runtime)? {
+        epoll_add(epoll, fd.as_raw_fd(), SHARED_TOKEN)?;
     }
-    SharedTransport::open(path)
-        .map(Some)
-        .map_err(|error| anyhow!("failed to open shared transport {path:?}: {error}"))
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let shared_path = env::args().skip(1).last().unwrap_or_default();
     xbar_core::logging::init("xcb_bar", &shared_path)?;
 
-    // Bars are consumers: open an existing WM-owned transport and never
-    // create or unlink it. The notifier owns both its eventfd and worker.
-    let transport = open_transport(&shared_path)?;
-    let notifier: Option<SharedEventNotifier> = transport
-        .as_ref()
-        .map(|transport| transport.notifier(true))
-        .transpose()?;
-    let runtime = BarRuntime::with_transport(ModelConfig::default(), transport)?;
+    let runtime = if shared_path.is_empty() {
+        BarRuntime::new(ModelConfig::default())?
+    } else {
+        let recovery = TransportRecoveryConfig::new(shared_path.clone(), TRANSPORT_RETRY_INTERVAL)?;
+        BarRuntime::with_managed_transport(ModelConfig::default(), recovery)?
+    };
 
     let (conn, screen_num) = xcb::Connection::connect(None)?;
     let setup = conn.get_setup();
@@ -605,7 +589,6 @@ fn main() -> Result<()> {
     let font_name = env::var("XBAR_FONT").unwrap_or_else(|_| "monospace 11".to_owned());
     let font = FontDescription::from_string(&font_name);
     let mut bar = CairoBar::new(runtime, presentation, font);
-    let mut last_transport_attempt = Instant::now();
 
     let win = conn.generate_id();
     let gc = conn.generate_id();
@@ -652,6 +635,7 @@ fn main() -> Result<()> {
         atoms: &atoms,
         win,
         bar_height,
+        process_actions: RefCell::new(ProcessActionHandler::default()),
     };
     let mut back = BackBuffer::new(
         window.conn,
@@ -679,9 +663,8 @@ fn main() -> Result<()> {
     let epoll = create_epoll()?;
     epoll_add(epoll.as_raw_fd(), window.conn.as_raw_fd(), X_TOKEN)?;
     epoll_add(epoll.as_raw_fd(), timer.as_raw_fd(), TIMER_TOKEN)?;
-    if let Some(notifier) = notifier.as_ref() {
-        epoll_add(epoll.as_raw_fd(), notifier.as_raw_fd(), SHARED_TOKEN)?;
-    }
+    let mut notifier_slot = TransportNotifierSlot::new(true);
+    sync_notifier(&mut notifier_slot, bar.runtime(), epoll.as_raw_fd())?;
 
     const EVENT_CAPACITY: usize = 32;
     let mut events: [libc::epoll_event; EVENT_CAPACITY] =
@@ -702,24 +685,11 @@ fn main() -> Result<()> {
                 )?,
                 TIMER_TOKEN => {
                     if timer.drain()? > 0 {
-                        if !shared_path.is_empty()
-                            && bar.runtime().transport().is_none()
-                            && last_transport_attempt.elapsed() >= TRANSPORT_RETRY_INTERVAL
-                        {
-                            last_transport_attempt = Instant::now();
-                            match SharedTransport::open(&shared_path) {
-                                Ok(transport) => {
-                                    bar.runtime_mut().set_transport(Some(transport));
-                                    debug!("reconnected WM transport at {shared_path}");
-                                }
-                                Err(error) => {
-                                    debug!("WM transport is still unavailable: {error}");
-                                }
-                            }
-                        }
                         let mut update = bar.tick();
                         update.merge(bar.poll_transport());
-                        if window.apply_runtime_update(update)? {
+                        let needs_redraw = window.apply_runtime_update(update)?;
+                        sync_notifier(&mut notifier_slot, bar.runtime(), epoll.as_raw_fd())?;
+                        if needs_redraw {
                             redraw(
                                 &cairo_xcb,
                                 &window,
@@ -733,10 +703,12 @@ fn main() -> Result<()> {
                     }
                 }
                 SHARED_TOKEN => {
-                    if let Some(notifier) = notifier.as_ref() {
+                    if let Some(notifier) = notifier_slot.notifier() {
                         notifier.drain()?;
                         let update = bar.poll_transport();
-                        if window.apply_runtime_update(update)? {
+                        let needs_redraw = window.apply_runtime_update(update)?;
+                        sync_notifier(&mut notifier_slot, bar.runtime(), epoll.as_raw_fd())?;
+                        if needs_redraw {
                             redraw(
                                 &cairo_xcb,
                                 &window,
