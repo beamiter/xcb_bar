@@ -3,7 +3,7 @@ use cairo::ffi::{xcb_connection_t, xcb_visualtype_t};
 use cairo::{Context, XCBConnection as CairoXCBConnection, XCBDrawable, XCBSurface, XCBVisualType};
 use log::{debug, warn};
 use pango::FontDescription;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
@@ -315,11 +315,20 @@ struct WindowAdapter<'a> {
     screen: &'a x::Screen,
     atoms: &'a Atoms,
     win: x::Window,
-    bar_height: u16,
+    bar_height: Cell<u16>,
     process_actions: RefCell<ProcessActionHandler>,
 }
 
 impl WindowAdapter<'_> {
+    fn sync_bar_height(&self, bar: &mut CairoBar, height: u16) {
+        // A window manager may enforce its configured dock height instead of
+        // the size requested when the window was created. Keep both future
+        // geometry requests and the presentation viewport fill in sync with
+        // that final server-side height.
+        self.bar_height.set(height);
+        bar.config_mut().bar_height = f32::from(height);
+    }
+
     fn apply_runtime_update(&self, update: RuntimeUpdate) -> Result<bool> {
         let needs_redraw = update.needs_redraw();
         for issue in update.issues {
@@ -360,23 +369,18 @@ impl WindowAdapter<'_> {
 
     fn apply_geometry(&self, geometry: MonitorGeometry) -> Result<()> {
         let width = geometry.width.max(1);
+        let bar_height = self.bar_height.get();
         self.conn.send_and_check_request(&x::ConfigureWindow {
             window: self.win,
             value_list: &[
                 x::ConfigWindow::X(geometry.x),
                 x::ConfigWindow::Y(geometry.y),
                 x::ConfigWindow::Width(width),
-                x::ConfigWindow::Height(u32::from(self.bar_height)),
+                x::ConfigWindow::Height(u32::from(bar_height)),
             ],
         })?;
         update_strut(
-            self.conn,
-            self.atoms,
-            self.win,
-            geometry.x,
-            geometry.y,
-            width,
-            self.bar_height,
+            self.conn, self.atoms, self.win, geometry.x, geometry.y, width, bar_height,
         )?;
         self.conn.flush()?;
         Ok(())
@@ -434,6 +438,7 @@ fn handle_x_event(
         xcb::Event::X(x::Event::ConfigureNotify(event)) if event.window() == window.win => {
             *current_width = event.width();
             *current_height = event.height();
+            window.sync_bar_height(bar, event.height());
             back.resize_if_needed(window.conn, window.win, *current_width, *current_height)?;
             should_redraw = true;
         }
@@ -634,7 +639,7 @@ fn main() -> Result<()> {
         screen,
         atoms: &atoms,
         win,
-        bar_height,
+        bar_height: Cell::new(bar_height),
         process_actions: RefCell::new(ProcessActionHandler::default()),
     };
     let mut back = BackBuffer::new(
